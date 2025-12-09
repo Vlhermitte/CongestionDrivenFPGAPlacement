@@ -40,7 +40,7 @@ Circuit Parser::parse(const std::string& input_filename) {
         std::string block_name;
         ss_block >> block_name;
         circuit.block_name_to_index[block_name] = i;
-        circuit.blocks.push_back({block_name, -1, -1});
+        circuit.blocks.push_back({i, block_name, -1, -1});
     }
 
     // 3. Read Fixed I/O Pins
@@ -54,7 +54,7 @@ Circuit Parser::parse(const std::string& input_filename) {
         double x, y;
         ss_pin >> pin_name >> x >> y;
         circuit.pin_name_to_index[pin_name] = i;
-        circuit.pins.push_back({pin_name, x, y});
+        circuit.pins.push_back({i, pin_name, x, y});
     }
 
     // 4. Read Nets
@@ -73,9 +73,11 @@ Circuit Parser::parse(const std::string& input_filename) {
             std::string terminal_name;
             ss_net >> terminal_name;
             if (circuit.block_name_to_index.contains(terminal_name)) {
-                net.terminals.push_back({terminal_name, TerminalType::BLOCK});
+                int id = circuit.block_name_to_index[terminal_name];
+                net.terminals.push_back({id, TerminalType::BLOCK});
             } else if (circuit.pin_name_to_index.contains(terminal_name)) {
-                net.terminals.push_back({terminal_name, TerminalType::PIN});
+                int id = circuit.pin_name_to_index[terminal_name];
+                net.terminals.push_back({id, TerminalType::PIN});
             } else {
                 std::cerr << "Warning: Terminal '" << terminal_name << "' in net '" << net.name << "' not found as block or pin." << std::endl;
             }

@@ -99,12 +99,14 @@ private:
 
     void update_bbox_cache(int net_idx, int x1, int y1, int x2, int y2, bool is_swap);
 
+    void update_single_net_bbox(int net_idx, int old_x, int old_y, int new_x, int new_y);
+
     // --- Private variables ---
     Circuit circuit_;
     int R_, C_;
 
     // 2D grid to check for placement legality (stores block name)
-    std::vector<std::vector<std::string>> grid_;
+    std::vector<std::vector<int>> grid_; // EMPTY_BLOCK_ID (-1) means empty cell
 
     // 2D grid for congestion map (U[x,y])
     std::vector<std::vector<int>> congestion_map_U_;

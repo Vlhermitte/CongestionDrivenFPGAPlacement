@@ -19,28 +19,37 @@
 
 Placer::Placer(Circuit circuit)
     : circuit_(std::move(circuit)),
-      R_(circuit_.R),
-      C_(circuit_.C), current_hpwl_(0), current_sum_U_(0), current_sum_sq_U_(0)
+      R_(circuit_.R), C_(circuit_.C),
+      current_hpwl_(0), current_sum_U_(0), current_sum_sq_U_(0)
 {
     if (R_ <= 0 || C_ <= 0)
     {
         throw std::invalid_argument("Grid dimensions must be positive.");
     }
 
+    const int HPWL_NET_LIMIT = 64; // Tunable threshold
+
     // Initialize the grid representations
-    grid_.resize(R_, std::vector<std::string>(C_, ""));
+    grid_.resize(R_, std::vector<int>(C_, EMPTY_BLOCK_ID));
     congestion_map_U_.resize(R_, std::vector<int>(C_, 0));
     net_bboxes_.resize(circuit_.nets.size());
 
     block_to_nets_.resize(circuit_.blocks.size());
     for (size_t i = 0; i < circuit_.nets.size(); ++i)
     {
+        // Ignore High-Fanout Nets. It is unlikely that moving once block will changes their bounding box
+        if (circuit_.nets[i].terminals.size() > HPWL_NET_LIMIT)
+        {
+            // Skip adding this net to block_to_nets_ lookup
+            continue;
+        }
+
         const auto& net = circuit_.nets[i];
         for (const auto& term : net.terminals)
         {
             if (term.type == TerminalType::BLOCK)
             {
-                int blk_idx = circuit_.block_name_to_index.at(term.name);
+                int blk_idx = term.id;
                 // Avoid duplicates if a net connects to multiple pins on the same block
                 auto& list = block_to_nets_.at(blk_idx);
                 if (std::find(list.begin(), list.end(), i) == list.end())
@@ -68,20 +77,21 @@ void Placer::random_initial_place() {
         do {
             x = dist_c(rng);
             y = dist_r(rng);
-        } while (!grid_[y][x].empty()); // Ensure legality
+        } while (grid_[y][x] != EMPTY_BLOCK_ID); // Ensure legality
 
         block.x = x;
         block.y = y;
-        grid_[y][x] = block.name;
+        grid_[y][x] = block.id;
     }
 }
-
 
 void Placer::place() {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // 1. Initial placement
     random_initial_place();
+
+    initialize_bbox_cache();
 
     // 2. Setup RNG
     std::random_device rd;
@@ -90,8 +100,6 @@ void Placer::place() {
     std::uniform_real_distribution<double> dist_prob(0.0, 1.0);
 
     // 3. SA Parameters and Initial Cost Calculation
-
-    // Initialize the incremental cost trackers before the loop starts
     // Calculate initial full congestion map
     calculate_congestion_coefficient(); // Populates congestion_map_U_ initially
 
@@ -126,25 +134,24 @@ void Placer::place() {
     // Initial temperature (Heuristic: usually set to allow ~99% acceptance initially)
     // Here we start high enough to escape local minima.
     double T = calibrate_T(0.95, lambda);
-    // double T = current_cost * 0.01; // Simple heuristic
+    // double T = current_cost * 0.1; // Simple heuristic
+    // double T = 10000.0; // Fixed high initial temperature
     double T_initial = T;
     double T_final = 0.005;
 
     // Moves per temperature step
     // Typically proportional to the number of blocks (e.g., 10 * N)
-    int moves_per_temp = 10 * circuit_.blocks.size();
+    double total_moves = 0.0; // Target total moves
+    double total_accepted_moves = 0.0;
+    int moves_per_temp = 15 * circuit_.blocks.size();
 
     double range_limiter = 1.0;
 
+    std::vector<int> affected_nets;
+    affected_nets.reserve(200); // Reserve decent space
+
     std::cout << "Starting SA..." << std::endl;
     std::cout << "Initial Cost: " << current_cost << " (T=" << T << ")" << std::endl;
-
-    for (size_t i = 0; i < circuit_.nets.size(); ++i) {
-        net_bboxes_[i] = get_net_bbox(circuit_.nets[i]);
-    }
-
-    std::vector<int> affected_nets;
-    affected_nets.reserve(100); // Reserve decent space
 
     // ---------------------------- //
     // 4. MAIN ANNEALING LOOP       //
@@ -165,12 +172,11 @@ void Placer::place() {
             }
 
             // -------------- A. PROPOSE MOVE -------------- //
-            // -------------- A. SELECT MOVE STRATEGY VIA RL -------------- //
 
             // --- Dynamic Window Calculation ---
             // Calculate range based on the feedback controller variable 'range_limiter'
-            int range_w = std::max(1, (int)(C_ * range_limiter));
-            int range_h = std::max(1, (int)(R_ * range_limiter));
+            int range_w = std::max(1, (int)(C_/2 * range_limiter));
+            int range_h = std::max(1, (int)(R_/2 * range_limiter));
 
             int src_idx = dist_block_idx(rng);
             Block& src_block = circuit_.blocks[src_idx];
@@ -194,20 +200,14 @@ void Placer::place() {
             if (x1 == x2 && y1 == y2) continue;
 
             // Check what is at the destination
-            std::string dest_name = grid_[y2][x2];
-            int dest_idx = -1;
-            bool is_swap = false;
-
-            if (!dest_name.empty()) {
-                // There is a block at the destination -> SWAP
-                is_swap = true;
-                dest_idx = circuit_.block_name_to_index.at(dest_name);
-            }
+            int dest_id = grid_[y2][x2];
+            bool is_swap = dest_id != EMPTY_BLOCK_ID;
 
             // Identify nets and remove their cost contributions
-            affected_nets = block_to_nets_.at(src_idx);
+            const auto& src_nets = block_to_nets_.at(src_idx);
+            affected_nets = src_nets;
             if (is_swap) {
-                const auto& dest_nets = block_to_nets_.at(dest_idx);
+                const auto& dest_nets = block_to_nets_.at(dest_id);
                 affected_nets.insert(affected_nets.end(), dest_nets.begin(), dest_nets.end());
             }
             // Remove duplicates (crucial if source and dest are on the same net)
@@ -230,23 +230,28 @@ void Placer::place() {
             // Move Source to (x2, y2)
             src_block.x = x2;
             src_block.y = y2;
-            grid_[y2][x2] = src_block.name;
+            grid_[y2][x2] = src_block.id;
 
             // If Swap, move Dest block to (x1, y1)
             if (is_swap) {
-                Block& dest_block = circuit_.blocks[dest_idx];
+                Block& dest_block = circuit_.blocks[dest_id];
                 dest_block.x = x1;
                 dest_block.y = y1;
-                grid_[y1][x1] = dest_block.name;
+                grid_[y1][x1] = dest_block.id;
             } else {
                 // Empty destination, so old source position becomes empty
-                grid_[y1][x1] = "";
+                grid_[y1][x1] = EMPTY_BLOCK_ID;
             }
 
-            // 3. Update BBox Cache (The new function)
-            for (int net_idx : affected_nets) {
-                // Pass: net_index, old_src_coords, new_src_coords, is_swap
-                update_bbox_cache(net_idx, x1, y1, x2, y2, is_swap);
+            // Update BBoxes - FIX: Update Src nets and Dest nets separately
+            for (int net_idx : src_nets) {
+                update_single_net_bbox(net_idx, x1, y1, x2, y2);
+            }
+            if (is_swap) {
+                const auto& dest_nets = block_to_nets_.at(dest_id);
+                for (int net_idx : dest_nets) {
+                    update_single_net_bbox(net_idx, x2, y2, x1, y1);
+                }
             }
 
             // ADD NEW COST CONTRIBUTION (Sets state to "new potential state")
@@ -290,15 +295,15 @@ void Placer::place() {
                 // 2. Revert positions (Same as original code)
                 src_block.x = x1;
                 src_block.y = y1;
-                grid_[y1][x1] = src_block.name;
+                grid_[y1][x1] = src_block.id;
 
                 if (is_swap) {
-                    Block& dest_block = circuit_.blocks[dest_idx];
+                    Block& dest_block = circuit_.blocks[dest_id];
                     dest_block.x = x2;
                     dest_block.y = y2;
-                    grid_[y2][x2] = dest_block.name;
+                    grid_[y2][x2] = dest_block.id;
                 } else {
-                    grid_[y2][x2] = "";
+                    grid_[y2][x2] = EMPTY_BLOCK_ID;
                 }
 
                 // We must restore bboxes *before* re-adding cost, so the cost calculation uses the correct box
@@ -312,12 +317,16 @@ void Placer::place() {
             // -------------- D. ACCEPT OR REJECT (end) -------------- //
         }
 
+        total_moves += moves_per_temp;
+        total_accepted_moves += accepted_moves;
+
         // -------------- E. COOL DOWN -------------- //
         // Adaptive Cooling Schedule
         double acceptance_rate = (double)accepted_moves / moves_per_temp;
         // Goal: Keep acceptance rate around 0.44
         if (accepted_moves > 0) {
             range_limiter = range_limiter * (acceptance_rate / 0.44);
+            // range_limiter = 1.0 - 0.44 + acceptance_rate;
         } else {
             // If acceptance is 0, we are frozen. Drastically shrink to try and find ANY valid move.
             range_limiter = std::min(1.0, range_limiter * 1.5);
@@ -328,15 +337,14 @@ void Placer::place() {
 
         // Adaptive alpha
         double alpha;
-        if (acceptance_rate > 0.95) {
-            alpha = 0.5; // Only cool fast if we are basically accepting everything (random walk)
-        } else if (acceptance_rate > 0.8) {
+        if (acceptance_rate > 0.95)
+            alpha = 0.7; // Only cool fast if we are basically accepting everything (random walk)
+        else if (acceptance_rate > 0.8)
             alpha = 0.90; // High acceptance phase. Cool relatively fast.
-        } else if (acceptance_rate > 0.15) {
+        else if (acceptance_rate > 0.15)
             alpha = 0.95; // Critical phase (crystallization). Cool very slowly.
-        } else {
+        else
             alpha = 0.80; // Frozen phase.
-        }
 
         T *= alpha;
         // Logging to track progress
@@ -358,28 +366,26 @@ void Placer::place() {
 
         // Cosine Schedule: Grow lambda as T drops
         lambda = lambda_min + 0.5 * (lambda_max - lambda_min) * (1 - std::cos(M_PI * progress));
+        // Recalculate current cost with new lambda
+        double cc = 1.0;
+        if (current_sum_U_ != 0) {
+            double N = R_ * C_;
+            double avg_U_sq = (current_sum_U_ / N) * (current_sum_U_ / N);
+            cc = (current_sum_sq_U_ / N) / avg_U_sq;
+        }
+        current_cost = current_hpwl_ + lambda * cc;
 
         // -------------- G. CORRECT ANY ERRORS (NUMERICAL DRIFT) -------------- //
         calculate_congestion_coefficient(); // This resets and refills congestion_map_U_ and current_sum_sq_U_
+        current_hpwl_ = calculate_total_hpwl();
 
         // -------------- F. CORRECT ANY ERRORS (end) -------------- //
     }
 
     end_annealing:
-    // Restore the Best Solution before exiting
-    // std::cout << "Restoring best solution found (Cost: " << global_best_cost << ")..." << std::endl;
-    // circuit_.blocks = best_blocks;
-    //
-    // // Restore the grid to match the best blocks
-    // // Clear grid
-    // for(auto& row : grid_) {
-    //     std::fill(row.begin(), row.end(), "");
-    // }
-    // // Fill grid
-    // for(const auto& b : circuit_.blocks) {
-    //     grid_[b.y][b.x] = b.name;
-    // }
-    std::cout << "Solution found (Cost: " << current_cost << ")..." << std::endl;
+    std::cout << "Solution found (Cost: " << current_cost << ")..."
+        << " Total Moves: " << total_moves
+        << ", Total Accepted Moves: " << total_accepted_moves << std::endl;
 }
 
 
@@ -426,25 +432,20 @@ double Placer::calibrate_T(double target_acceptance_rate, double lambda) {
         if (x1 == x2 && y1 == y2) continue;
 
         // Check destination
-        std::string dest_name = grid_[y2][x2];
-        int dest_idx = -1;
-        bool is_swap = false;
-        if (!dest_name.empty()) {
-            is_swap = true;
-            dest_idx = circuit_.block_name_to_index.at(dest_name);
-        }
+        int dest_id = grid_[y2][x2];
+        bool is_swap = (dest_id != EMPTY_BLOCK_ID);
 
         // 1. Identify Nets
         affected_nets.clear();
         affected_nets = block_to_nets_.at(src_idx);
         if (is_swap) {
-            const auto& dest_nets = block_to_nets_.at(dest_idx);
+            const auto& dest_nets = block_to_nets_.at(dest_id);
             affected_nets.insert(affected_nets.end(), dest_nets.begin(), dest_nets.end());
         }
         std::sort(affected_nets.begin(), affected_nets.end());
         affected_nets.erase(std::unique(affected_nets.begin(), affected_nets.end()), affected_nets.end());
 
-        // 2. Backup BBoxes (CRITICAL STEP MISSING IN OLD CODE)
+        // 2. Backup BBoxes
         std::vector<BoundingBox> old_bboxes;
         old_bboxes.reserve(affected_nets.size());
         for(int net_idx : affected_nets) {
@@ -457,18 +458,19 @@ double Placer::calibrate_T(double target_acceptance_rate, double lambda) {
         // 4. Apply Move (Simulate)
         update_cost_structures(affected_nets, true); // Remove old
 
-        src_block.x = x2; src_block.y = y2;
-        grid_[y2][x2] = src_block.name;
+        src_block.x = x2;
+        src_block.y = y2;
+        grid_[y2][x2] = src_block.id;
 
         if (is_swap) {
-            Block& dest_block = circuit_.blocks[dest_idx];
+            Block& dest_block = circuit_.blocks[dest_id];
             dest_block.x = x1; dest_block.y = y1;
-            grid_[y1][x1] = dest_block.name;
+            grid_[y1][x1] = dest_block.id;
         } else {
-            grid_[y1][x1] = "";
+            grid_[y1][x1] = EMPTY_BLOCK_ID;
         }
 
-        // Update BBoxes (CRITICAL STEP MISSING IN OLD CODE)
+        // Update BBoxes
         for (int net_idx : affected_nets) {
             update_bbox_cache(net_idx, x1, y1, x2, y2, is_swap);
         }
@@ -488,17 +490,17 @@ double Placer::calibrate_T(double target_acceptance_rate, double lambda) {
         update_cost_structures(affected_nets, true); // Remove new
 
         src_block.x = x1; src_block.y = y1;
-        grid_[y1][x1] = src_block.name;
+        grid_[y1][x1] = src_block.id;
 
         if (is_swap) {
-            Block& dest_block = circuit_.blocks[dest_idx];
+            Block& dest_block = circuit_.blocks[dest_id];
             dest_block.x = x2; dest_block.y = y2;
-            grid_[y2][x2] = dest_block.name;
+            grid_[y2][x2] = dest_block.id;
         } else {
-            grid_[y2][x2] = "";
+            grid_[y2][x2] = EMPTY_BLOCK_ID;
         }
 
-        // Restore BBoxes (CRITICAL STEP MISSING IN OLD CODE)
+        // Restore BBoxes
         for(size_t k = 0; k < affected_nets.size(); ++k) {
             net_bboxes_[affected_nets[k]] = old_bboxes[k];
         }
@@ -547,7 +549,6 @@ void Placer::update_cost_structures(const std::vector<int>& net_indices, bool re
 
                 // If removing, we decrement U. If adding, we increment U.
                 // We must update sum_sq_U_ based on the change: (u+1)^2 - u^2 = 2u+1, etc.
-
                 if (remove) {
                     // Moving from old_u to (old_u - 1)
                     // Change in square: (u-1)^2 - u^2 = -2u + 1
@@ -572,7 +573,7 @@ BoundingBox Placer::get_net_bbox(const Net& net) const {
 
     for (const auto& terminal : net.terminals) {
         if (terminal.type == TerminalType::BLOCK) {
-            const Block& block = circuit_.blocks[circuit_.block_name_to_index.at(terminal.name)];
+            const Block& block = circuit_.blocks[terminal.id];
             if (block.x == -1) { // Check if block is placed
                 throw std::runtime_error("Calculating BBox for unplaced block: " + block.name);
             }
@@ -583,7 +584,7 @@ BoundingBox Placer::get_net_bbox(const Net& net) const {
             bbox.y_max = std::max(bbox.y_max, static_cast<double>(block.y + 1));
 
         } else if (terminal.type == TerminalType::PIN) {
-            const Pin& pin = circuit_.pins[circuit_.pin_name_to_index.at(terminal.name)];
+            const Pin& pin = circuit_.pins[terminal.id];
             // Per spec: (x_p, y_p) for both min and max
             bbox.x_min = std::min(bbox.x_min, pin.x);
             bbox.y_min = std::min(bbox.y_min, pin.y);
@@ -652,6 +653,30 @@ void Placer::update_bbox_cache(int net_idx, int x1, int y1, int x2, int y2, bool
             bbox.y_min = std::min(bbox.y_min, static_cast<double>(y1));
             bbox.y_max = std::max(bbox.y_max, static_cast<double>(y1 + 1));
         }
+    }
+}
+
+void Placer::update_single_net_bbox(int net_idx, int old_x, int old_y, int new_x, int new_y) {
+    BoundingBox& bbox = net_bboxes_[net_idx];
+    const double eps = 1e-9;
+
+    // Check if the block was defining the boundary
+    bool on_boundary =
+        (std::abs(bbox.x_min - old_x) < eps) ||
+        (std::abs(bbox.x_max - (old_x + 1)) < eps) ||
+        (std::abs(bbox.y_min - old_y) < eps) ||
+        (std::abs(bbox.y_max - (old_y + 1)) < eps);
+
+    if (on_boundary) {
+        // Slow path: Full Recompute
+        // Since the grid/blocks are already updated, this gets the correct new bbox
+        bbox = get_net_bbox(circuit_.nets[net_idx]);
+    } else {
+        // Fast path: Just expand to include new position
+        bbox.x_min = std::min(bbox.x_min, (double)new_x);
+        bbox.y_min = std::min(bbox.y_min, (double)new_y);
+        bbox.x_max = std::max(bbox.x_max, (double)new_x + 1);
+        bbox.y_max = std::max(bbox.y_max, (double)new_y + 1);
     }
 }
 
@@ -755,7 +780,6 @@ void Placer::write_output(const std::string& output_filename) const {
             throw std::runtime_error("Attempting to write output with unplaced block: " + block.name);
         }
         // 2. Bounds Sanity Check
-        // If x or y are wild integers (e.g. -2147483648), memory is corrupted.
         if (block.x < 0 || block.x >= C_ || block.y < 0 || block.y >= R_) {
             std::cerr << "CRITICAL ERROR: Block " << i << " has invalid coordinates ("
                       << block.x << ", " << block.y << "). Skipping." << std::endl;
@@ -789,9 +813,12 @@ void Placer::print_placement_grid() const {
     for (int y = 0; y < R_; ++y) {
         std::cerr << std::setw(4) << std::right << y << " | "; // Y-axis label
         for (int x = 0; x < C_; ++x) {
-            std::string name = grid_[y][x];
-            if (name.empty()) {
+            int id = grid_[y][x];
+            std::string name;
+            if (id == EMPTY_BLOCK_ID) {
                 name = "."; // Empty site
+            } else {
+                name = circuit_.blocks[id].name;
             }
             // Truncate if name is too long
             if (name.length() > cell_width - 2) {

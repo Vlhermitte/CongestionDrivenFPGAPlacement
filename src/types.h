@@ -11,9 +11,12 @@
 #include <memory>
 
 
+constexpr int EMPTY_BLOCK_ID = -1;
+
 // Represents a movable logic block.
 // Its coordinates (x, y) are integers.
 struct Block {
+    int id = -1;
     std::string name;
     int x = -1; // Initial invalid coordinates
     int y = -1;
@@ -22,6 +25,7 @@ struct Block {
 // Represents a fixed I/O pin.
 // Its coordinates (x, y) can be non-integers.
 struct Pin {
+    int id = -1;
     std::string name;
     double x;
     double y;
@@ -32,13 +36,15 @@ struct Pin {
 enum class TerminalType { BLOCK, PIN };
 
 struct Terminal {
-    std::string name;
+    // std::string name;
+    int id;
     TerminalType type;
 };
 
 // Represents a net, which is a collection of terminals.
 struct Net {
     std::string name;
+    int id;
     std::vector<Terminal> terminals;
 };
 

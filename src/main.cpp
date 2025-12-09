@@ -30,7 +30,7 @@ int main(int argc, char* argv[]) {
 
     // Chrono
     auto start_time = std::chrono::high_resolution_clock::now();
-    int num_threads = std::thread::hardware_concurrency();
+    // int num_threads = std::thread::hardware_concurrency();
 
     try {
         // 1. Parse the input file
