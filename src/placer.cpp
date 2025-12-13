@@ -15,6 +15,7 @@
 #include <sstream>
 #include <chrono>
 #include <numeric>
+#include <filesystem>
 
 
 Placer::Placer(Circuit circuit)
@@ -767,6 +768,15 @@ void Placer::write_output(const std::string& output_filename) const {
     if (circuit_.blocks.empty()) {
         std::cerr << "Warning: No blocks to write!" << std::endl;
         return;
+    }
+
+    std::filesystem::path out_path(output_filename);
+    if (!out_path.parent_path().empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(out_path.parent_path(), ec);
+        if (ec) {
+            throw std::runtime_error("Failed to create output directory: " + ec.message());
+        }
     }
 
     std::ofstream file(output_filename);
